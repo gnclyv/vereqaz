@@ -117,7 +117,7 @@ function setupUploadForm() {
     if (!form) return;
     
     // Supabase AÇARLARINI BURAYA YAZ
-    const supabase = supabase.createClient('URL_BURA', 'KEY_BURA');
+    const supabase = supabase.createClient('https://hhrbkricwmmtgpwygedq.supabase.co', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhocmJrcmljd21tdGdwd3lnZWRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyMjQwNTUsImV4cCI6MjA5OTgwMDA1NX0.n-shxgUao7ovM852I0fKcs0q00yM8Fw5aceF8wtd4ts');
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
