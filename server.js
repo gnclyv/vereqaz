@@ -1,199 +1,138 @@
-let currentUser = null;
+require('dotenv').config();
+const path = require('path');
+const crypto = require('crypto');
+const express = require('express');
+const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
+const bcrypt = require('bcryptjs');
+const { createClient } = require('@supabase/supabase-js');
+const db = require('./db');
 
-// ---------- Toast fallback ----------
-function showToast(message, type = 'success') {
-  if (typeof window.showToast === 'function' && window.showToast !== showToast) {
-    return window.showToast(message, type);
-  }
-  const el = document.createElement('div');
-  el.textContent = message;
-  el.style.cssText = `
-    position:fixed; bottom:20px; right:20px; z-index:9999;
-    padding:12px 18px; border-radius:8px; color:#fff; font-size:14px;
-    background:${type === 'error' ? '#A83232' : '#2F6F4E'};
-    box-shadow:0 4px 12px rgba(0,0,0,.3);
-  `;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3500);
-}
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// ---------- Başlanğıc ----------
-document.addEventListener('DOMContentLoaded', () => {
-  safeInit('checkUser', checkUser);
-  safeInit('fetchBooks', fetchBooks);
-  safeInit('setupDragAndDrop', setupDragAndDrop);
-  safeInit('setupUploadForm', setupUploadForm);
+// Supabase Storage müştərisi (Birbaşa brauzerdən yükləmə üçün)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-  const searchInput = document.getElementById('searchInput');
-  const categorySelect = document.getElementById('categorySelect');
-  if (searchInput) searchInput.addEventListener('input', debounce(fetchBooks, 300));
-  if (categorySelect) categorySelect.addEventListener('change', fetchBooks);
+app.use(express.json({ limit: '1mb' })); // Yalnız JSON qəbul edirik, fayl gəlmir
+app.use(express.urlencoded({ extended: true }));
+app.set('trust proxy', 1);
+
+// Sessiya konfiqurasiyası
+const sessionStore = new PgSession({
+  conString: process.env.DATABASE_URL,
+  tableName: 'session',
+  createTableIfMissing: true,
+  ssl: { rejectUnauthorized: false }
 });
 
-function safeInit(name, fn) {
-  try { fn(); } catch (err) { console.error(`Başlatma xətası (${name}):`, err); }
+app.use(session({
+  store: sessionStore,
+  secret: process.env.SESSION_SECRET || 'gizli-acar-' + crypto.randomBytes(16).toString('hex'),
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24 * 7,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+  }
+}));
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- Köməkçi funksiyalar ---
+function requireAuth(req, res, next) {
+  if (!req.session.userId) return res.status(401).json({ error: 'Daxil olun!' });
+  next();
 }
 
-function debounce(func, delay) {
-  let timer;
-  return function (...args) {
-    clearTimeout(timer);
-    timer = setTimeout(() => func.apply(this, args), delay);
-  };
+function publicUser(row) {
+  return { id: row.id, username: row.username, email: row.email, avatarColor: row.avatar_color };
 }
 
-// ---------- 1. İstifadəçi yoxlanışı ----------
-async function checkUser() {
+// --- Auth API ---
+app.post('/api/register', async (req, res) => {
   try {
-    const res = await fetch('/api/me', { credentials: 'include' });
-    const data = await res.json();
-    if (data.user) {
-      currentUser = data.user;
-      const greet = document.getElementById('greetName');
-      const label = document.getElementById('usernameLabel');
-      const avatar = document.getElementById('avatar');
-      if (greet) greet.textContent = currentUser.username;
-      if (label) label.textContent = currentUser.username;
-      if (avatar) {
-        avatar.textContent = currentUser.username.charAt(0).toUpperCase();
-        avatar.style.background = currentUser.avatarColor || '#c9a227';
-      }
-    } else {
-      window.location.href = '/login.html';
-    }
-  } catch (err) { console.error('İstifadəçi yoxlanılarkən xəta:', err); }
-}
+    const { username, email, password } = req.body;
+    const exists = await db.userExists(username.trim(), email.trim().toLowerCase());
+    if (exists) return res.status(409).json({ error: 'İstifadəçi mövcuddur' });
+    const hash = await bcrypt.hash(password, 10);
+    const user = await db.createUser({ username: username.trim(), email: email.trim().toLowerCase(), password_hash: hash });
+    req.session.userId = user.id;
+    res.json({ user: publicUser(user) });
+  } catch (e) { res.status(500).json({ error: 'Server xətası' }); }
+});
 
-// ---------- 2. Kitabların siyahısı ----------
-async function fetchBooks() {
-  const skeleton = document.getElementById('skeletonGrid');
-  const grid = document.getElementById('bookGrid');
-  const emptyState = document.getElementById('emptyState');
-  const searchVal = document.getElementById('searchInput')?.value || '';
-  const categoryVal = document.getElementById('categorySelect')?.value || 'Hamısı';
-
-  if (skeleton) skeleton.style.display = 'grid';
-  if (grid) grid.style.display = 'none';
-  if (emptyState) emptyState.style.display = 'none';
-
+app.post('/api/login', async (req, res) => {
   try {
-    let url = `/api/books?q=${encodeURIComponent(searchVal)}`;
-    if (categoryVal !== 'Hamısı') url += `&category=${encodeURIComponent(categoryVal)}`;
-    const res = await fetch(url, { credentials: 'include' });
-    if (res.status === 401) { window.location.href = '/login.html'; return; }
-    
-    const data = await res.json();
-    const books = data.books || [];
+    const user = await db.findUserByUsernameOrEmail(req.body.identifier.trim());
+    if (user && await bcrypt.compare(req.body.password, user.password_hash)) {
+      req.session.userId = user.id;
+      res.json({ user: publicUser(user) });
+    } else { res.status(401).json({ error: 'Yanlış məlumatlar' }); }
+  } catch (e) { res.status(500).json({ error: 'Server xətası' }); }
+});
 
-    if (grid) grid.innerHTML = '';
-    if (skeleton) skeleton.style.display = 'none';
-    if (books.length === 0) { if (emptyState) emptyState.style.display = 'block'; return; }
-    
-    if (grid) grid.style.display = 'grid';
-    books.forEach((book, index) => {
-      const coverHtml = book.cover_image ? `<img src="${book.cover_image}" class="book-cover-img">` : `<div class="glyph">${book.title.charAt(0)}</div>`;
-      const deleteBtn = (currentUser && book.uploaded_by === currentUser.id) ? `<button class="icon-btn del" onclick="deleteBook('${book.id}')">🗑️</button>` : '';
-      const card = document.createElement('div');
-      card.className = 'book-card';
-      card.innerHTML = `
-        <div class="cover">${coverHtml}</div>
-        <div class="card-body">
-          <h3>${book.title}</h3>
-          <div class="author">${book.author}</div>
-          <div class="card-actions">
-            <a href="/api/books/${book.id}/view" target="_blank" class="icon-btn">👁️</a>
-            <a href="/api/books/${book.id}/download" class="icon-btn">⬇️</a>
-            ${deleteBtn}
-          </div>
-        </div>
-      `;
-      grid.appendChild(card);
+app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
+
+app.get('/api/me', async (req, res) => {
+  if (!req.session.userId) return res.json({ user: null });
+  const user = await db.findUserById(req.session.userId);
+  res.json({ user: user ? publicUser(user) : null });
+});
+
+// --- Books API (Burada multer yoxdur, birbaşa JSON gəlir) ---
+app.get('/api/books', requireAuth, async (req, res) => {
+  const rows = await db.listBooks({ q: (req.query.q || ''), category: (req.query.category || '') });
+  res.json({ books: rows });
+});
+
+app.post('/api/books', requireAuth, async (req, res) => {
+  try {
+    const { title, author, category, filename, filesize, description } = req.body;
+    if (!filename) return res.status(400).json({ error: 'Fayl URL-i tələb olunur' });
+
+    const book = await db.createBook({
+      title: title.trim(),
+      author: author.trim(),
+      description: (description || '').trim(),
+      category: category || 'Digər',
+      filename: filename,
+      filesize: filesize,
+      uploaded_by: req.session.userId
     });
-  } catch (err) { console.error(err); }
+    res.status(201).json({ id: book.id });
+  } catch (e) {
+    console.error('DATABASE UPLOAD ERROR:', e);
+    res.status(500).json({ error: 'Bazaya yazıla bilmədi' });
+  }
+});
+
+app.delete('/api/books/:id', requireAuth, async (req, res) => {
+  try {
+    const book = await db.findBookById(req.params.id);
+    if (!book) return res.status(404).json({ error: 'Kitab tapılmadı' });
+    if (book.uploaded_by !== req.session.userId) return res.status(403).json({ error: 'Səlahiyyət yoxdur' });
+
+    // Supabase-dən faylı silmək üçün fayl adını çıxarırıq
+    const fileName = book.filename.split('/').pop();
+    await supabase.storage.from('books').remove([fileName]);
+    await db.deleteBook(book.id);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Silinmə xətası' }); }
+});
+
+// --- Yönləndirmələr ---
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// --- Server ---
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Server işə düşdü: ${PORT}`));
 }
 
-// ---------- 3. Modal ----------
-function openModal() { document.getElementById('modalOverlay')?.classList.add('open'); }
-function closeModal() {
-  document.getElementById('modalOverlay')?.classList.remove('open');
-  document.getElementById('uploadForm')?.reset();
-}
-
-// ---------- 4. Kitab yükləmə (Supabase Client-Side) ----------
-function setupUploadForm() {
-  const form = document.getElementById('uploadForm');
-  if (!form) return;
-
-  // Supabase müştərisi (Açarlarını bura yaz)
-  const supabase = supabase.createClient('URL_BURA', 'KEY_BURA');
-
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const pdfInput = document.getElementById('pdfInput');
-    const titleInput = document.getElementById('titleInput');
-    const authorInput = document.getElementById('authorInput');
-    const catInput = document.getElementById('catInput');
-    const uploadBtn = document.getElementById('uploadBtn');
-
-    if (!pdfInput.files[0]) return showToast('Zəhmət olmasa PDF faylı seçin!', 'error');
-
-    uploadBtn.disabled = true;
-    showToast('Yüklənir...', 'success');
-
-    try {
-      const file = pdfInput.files[0];
-      const fileName = Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
-
-      // 1. Faylı Supabase-ə göndər
-      const { data, error } = await supabase.storage.from('books').upload(fileName, file);
-      if (error) throw error;
-
-      // 2. URL-i al
-      const publicUrl = supabase.storage.from('books').getPublicUrl(fileName).data.publicUrl;
-
-      // 3. Serverə JSON göndər
-      const res = await fetch('/api/books', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: titleInput.value,
-          author: authorInput.value,
-          category: catInput ? catInput.value : 'Digər',
-          filename: publicUrl,
-          filesize: file.size
-        })
-      });
-
-      if (!res.ok) throw new Error('Serverdə xəta baş verdi');
-      showToast('Kitab yükləndi!');
-      closeModal();
-      fetchBooks();
-    } catch (err) {
-      showToast(err.message, 'error');
-    } finally {
-      uploadBtn.disabled = false;
-    }
-  });
-}
-
-// ---------- 5. Kitabı silmək ----------
-async function deleteBook(id) {
-  if (!confirm('Silmək istədiyinizdən əminsiniz?')) return;
-  const res = await fetch(`/api/books/${id}`, { method: 'DELETE', credentials: 'include' });
-  if (res.ok) { showToast('Kitab silindi'); fetchBooks(); }
-}
-
-// ---------- Sürüklə-burax ----------
-function setupDragAndDrop() {
-  const zone = document.getElementById('dropZone');
-  const input = document.getElementById('pdfInput');
-  if (!zone || !input) return;
-  zone.addEventListener('click', () => input.click());
-  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.style.borderColor = 'var(--gold)'; });
-  zone.addEventListener('dragleave', () => { zone.style.borderColor = 'var(--line)'; });
-  zone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    zone.style.borderColor = 'var(--line)';
-    if (e.dataTransfer.files.length) input.files = e.dataTransfer.files;
-  });
-}
+module.exports = app;
