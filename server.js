@@ -1,281 +1,199 @@
-require('dotenv').config();
-const path = require('path');
-const crypto = require('crypto');
-const express = require('express');
-const session = require('express-session');
-const PgSession = require('connect-pg-simple')(session);
-const bcrypt = require('bcryptjs');
-const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
-const db = require('./db');
+let currentUser = null;
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Supabase Storage müştərisi
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.set('trust proxy', 1);
-
-// Sessiya konfiqurasiyası (Vercel və Localhost üçün uyğunlaşdırılmış)
-const sessionStore = new PgSession({
-  conString: process.env.DATABASE_URL,
-  tableName: 'session',
-  createTableIfMissing: true, // 'session' cədvəli yoxdursa avtomatik yaradılsın
-  ssl: { rejectUnauthorized: false } // Neon Postgres SSL tələb edir
-});
-
-// Sessiya bazasında xəta olarsa artıq sükutla uduldma yerinə loglanır
-sessionStore.on('error', (err) => {
-  console.error('SESSION STORE XƏTASI:', err);
-});
-
-app.use(session({
-  store: sessionStore,
-  secret: process.env.SESSION_SECRET || 'kitabxana-gizli-acar-' + crypto.randomBytes(16).toString('hex'),
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    maxAge: 1000 * 60 * 60 * 24 * 7,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+// ---------- Toast fallback ----------
+function showToast(message, type = 'success') {
+  if (typeof window.showToast === 'function' && window.showToast !== showToast) {
+    return window.showToast(message, type);
   }
-}));
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Multer (PDF + üz qabığı şəkli üçün xətasız konfiqurasiya)
-// DİQQƏT: upload.fields(['pdf','cover']) HTML-dəki input `name` atributu
-// ilə tam eyni olmayanda "Unexpected field" xətası ilə bütün sorğunu
-// çökdürürdü. upload.any() istənilən sahə adını qəbul edir, faylları isə
-// aşağıda MIME tipinə görə (PDF / şəkil) tanıyırıq — HTML-dəki adlardan asılı olmur.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const isPdf = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf');
-    const isImage = file.mimetype.startsWith('image/');
-    if (isPdf || isImage) return cb(null, true);
-    cb(new Error('Yalnız PDF və ya şəkil faylına icazə verilir: ' + file.fieldname));
-  }
-});
-
-const uploadBookFiles = upload.any();
-// ---------- Köməkçi funksiyalar ----------
-function requireAuth(req, res, next) {
-  if (!req.session.userId) return res.status(401).json({ error: 'Bu əməliyyat üçün daxil olmalısınız' });
-  next();
+  const el = document.createElement('div');
+  el.textContent = message;
+  el.style.cssText = `
+    position:fixed; bottom:20px; right:20px; z-index:9999;
+    padding:12px 18px; border-radius:8px; color:#fff; font-size:14px;
+    background:${type === 'error' ? '#A83232' : '#2F6F4E'};
+    box-shadow:0 4px 12px rgba(0,0,0,.3);
+  `;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
 }
 
-function publicUser(row) {
-  return { id: row.id, username: row.username, email: row.email, avatarColor: row.avatar_color };
-}
+// ---------- Başlanğıc ----------
+document.addEventListener('DOMContentLoaded', () => {
+  safeInit('checkUser', checkUser);
+  safeInit('fetchBooks', fetchBooks);
+  safeInit('setupDragAndDrop', setupDragAndDrop);
+  safeInit('setupUploadForm', setupUploadForm);
 
-const AVATAR_COLORS = ['#C9A227', '#A83232', '#3C6E71', '#7A5C9E', '#B5651D', '#2F6F4E'];
-
-// ---------- AUTH API ----------
-app.post('/api/register', async (req, res) => {
-  try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) return res.status(400).json({ error: 'Bütün xanaları doldurun' });
-
-    const uname = username.trim();
-    const email2 = email.trim().toLowerCase();
-    const exists = await db.userExists(uname, email2);
-    if (exists) return res.status(409).json({ error: 'İstifadəçi artıq mövcuddur' });
-
-    const hash = await bcrypt.hash(password, 10);
-    const color = AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
-    const user = await db.createUser({ username: uname, email: email2, password_hash: hash, avatar_color: color });
-
-    req.session.userId = user.id;
-    res.json({ user: publicUser(user) });
-  } catch (e) {
-    console.error('REGISTER ERROR:', e);
-    res.status(500).json({ error: 'Server xətası' });
-  }
+  const searchInput = document.getElementById('searchInput');
+  const categorySelect = document.getElementById('categorySelect');
+  if (searchInput) searchInput.addEventListener('input', debounce(fetchBooks, 300));
+  if (categorySelect) categorySelect.addEventListener('change', fetchBooks);
 });
 
-app.post('/api/login', async (req, res) => {
+function safeInit(name, fn) {
+  try { fn(); } catch (err) { console.error(`Başlatma xətası (${name}):`, err); }
+}
+
+function debounce(func, delay) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => func.apply(this, args), delay);
+  };
+}
+
+// ---------- 1. İstifadəçi yoxlanışı ----------
+async function checkUser() {
   try {
-    const { identifier, password } = req.body;
-    const user = await db.findUserByUsernameOrEmail(identifier.trim());
-    if (user && await bcrypt.compare(password, user.password_hash)) {
-      req.session.userId = user.id;
-      res.json({ user: publicUser(user) });
+    const res = await fetch('/api/me', { credentials: 'include' });
+    const data = await res.json();
+    if (data.user) {
+      currentUser = data.user;
+      const greet = document.getElementById('greetName');
+      const label = document.getElementById('usernameLabel');
+      const avatar = document.getElementById('avatar');
+      if (greet) greet.textContent = currentUser.username;
+      if (label) label.textContent = currentUser.username;
+      if (avatar) {
+        avatar.textContent = currentUser.username.charAt(0).toUpperCase();
+        avatar.style.background = currentUser.avatarColor || '#c9a227';
+      }
     } else {
-      res.status(401).json({ error: 'Yanlış giriş məlumatları' });
+      window.location.href = '/login.html';
     }
-  } catch (e) {
-    console.error('LOGIN ERROR:', e);
-    res.status(500).json({ error: 'Server xətası' });
-  }
-});
+  } catch (err) { console.error('İstifadəçi yoxlanılarkən xəta:', err); }
+}
 
-app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
+// ---------- 2. Kitabların siyahısı ----------
+async function fetchBooks() {
+  const skeleton = document.getElementById('skeletonGrid');
+  const grid = document.getElementById('bookGrid');
+  const emptyState = document.getElementById('emptyState');
+  const searchVal = document.getElementById('searchInput')?.value || '';
+  const categoryVal = document.getElementById('categorySelect')?.value || 'Hamısı';
 
-app.get('/api/me', async (req, res) => {
+  if (skeleton) skeleton.style.display = 'grid';
+  if (grid) grid.style.display = 'none';
+  if (emptyState) emptyState.style.display = 'none';
+
   try {
-    if (!req.session.userId) return res.json({ user: null });
-    const user = await db.findUserById(req.session.userId);
-    res.json({ user: user ? publicUser(user) : null });
-  } catch (e) {
-    console.error('ME ERROR:', e);
-    res.status(500).json({ error: 'Server xətası' });
-  }
-});
+    let url = `/api/books?q=${encodeURIComponent(searchVal)}`;
+    if (categoryVal !== 'Hamısı') url += `&category=${encodeURIComponent(categoryVal)}`;
+    const res = await fetch(url, { credentials: 'include' });
+    if (res.status === 401) { window.location.href = '/login.html'; return; }
+    
+    const data = await res.json();
+    const books = data.books || [];
 
-// ---------- BOOKS API ----------
-app.get('/api/books', requireAuth, async (req, res) => {
-  try {
-    const rows = await db.listBooks({ q: (req.query.q || ''), category: (req.query.category || '') });
-    res.json({ books: rows.map(r => ({ ...r, id: r.id, title: r.title, author: r.author, description: r.description, category: r.category, filesize: r.filesize, cover_image: r.cover_image, uploaded_by: r.uploaded_by, downloads: r.downloads })) });
-  } catch (e) {
-    console.error('LIST BOOKS ERROR:', e);
-    res.status(500).json({ error: 'Kitablar yüklənmədi' });
-  }
-});
-
-app.post('/api/books', requireAuth, uploadBookFiles, async (req, res) => {
-  try {
-    const files = req.files || [];
-    const pdfFile = files.find(f => f.mimetype === 'application/pdf' || f.originalname.toLowerCase().endsWith('.pdf'));
-    const coverFile = files.find(f => f.mimetype.startsWith('image/'));
-
-    if (!pdfFile) {
-      console.error('PDF tapılmadı. Gələn sahələr:', files.map(f => ({ field: f.fieldname, mime: f.mimetype })));
-      return res.status(400).json({ error: 'PDF faylı seçilməyib' });
-    }
-    if (!req.body.title || !req.body.author) {
-      return res.status(400).json({ error: 'Kitabın adı və müəllifi mütləqdir' });
-    }
-
-    const uniqueName = Date.now() + '-' + crypto.randomBytes(6).toString('hex') + '.pdf';
-    const { error: pdfError } = await supabase.storage
-      .from('books')
-      .upload(uniqueName, pdfFile.buffer, { contentType: 'application/pdf' });
-    if (pdfError) throw pdfError;
-    const publicUrl = supabase.storage.from('books').getPublicUrl(uniqueName).data.publicUrl;
-
-    // Üz qabığı şəkli seçilibsə, onu da Supabase-ə yükləyirik
-    let coverUrl = null;
-    if (coverFile) {
-      const coverExt = (coverFile.originalname.split('.').pop() || 'jpg').toLowerCase();
-      const coverName = Date.now() + '-' + crypto.randomBytes(6).toString('hex') + '.' + coverExt;
-      const { error: coverError } = await supabase.storage
-        .from('books')
-        .upload(coverName, coverFile.buffer, { contentType: coverFile.mimetype });
-      if (coverError) throw coverError;
-      coverUrl = supabase.storage.from('books').getPublicUrl(coverName).data.publicUrl;
-    }
-
-    const book = await db.createBook({
-      title: req.body.title.trim(),
-      author: req.body.author.trim(),
-      description: (req.body.description || '').trim(),
-      category: req.body.category || 'Digər',
-      filename: publicUrl,
-      original_name: pdfFile.originalname,
-      filesize: pdfFile.size,
-      cover_image: coverUrl,
-      uploaded_by: req.session.userId
+    if (grid) grid.innerHTML = '';
+    if (skeleton) skeleton.style.display = 'none';
+    if (books.length === 0) { if (emptyState) emptyState.style.display = 'block'; return; }
+    
+    if (grid) grid.style.display = 'grid';
+    books.forEach((book, index) => {
+      const coverHtml = book.cover_image ? `<img src="${book.cover_image}" class="book-cover-img">` : `<div class="glyph">${book.title.charAt(0)}</div>`;
+      const deleteBtn = (currentUser && book.uploaded_by === currentUser.id) ? `<button class="icon-btn del" onclick="deleteBook('${book.id}')">🗑️</button>` : '';
+      const card = document.createElement('div');
+      card.className = 'book-card';
+      card.innerHTML = `
+        <div class="cover">${coverHtml}</div>
+        <div class="card-body">
+          <h3>${book.title}</h3>
+          <div class="author">${book.author}</div>
+          <div class="card-actions">
+            <a href="/api/books/${book.id}/view" target="_blank" class="icon-btn">👁️</a>
+            <a href="/api/books/${book.id}/download" class="icon-btn">⬇️</a>
+            ${deleteBtn}
+          </div>
+        </div>
+      `;
+      grid.appendChild(card);
     });
-    res.status(201).json({ id: book.id });
-  } catch (e) {
-    console.error('UPLOAD ERROR:', e);
-    res.status(500).json({ error: 'Yükləmə xətası' });
-  }
-});
+  } catch (err) { console.error(err); }
+}
 
-app.get('/api/books/:id/download', requireAuth, async (req, res) => {
-  try {
-    const book = await db.findBookById(req.params.id);
-    if (!book) return res.status(404).json({ error: 'Kitab tapılmadı' });
-    await db.incrementDownloads(book.id);
-    res.redirect(book.filename);
-  } catch (e) {
-    console.error('DOWNLOAD ERROR:', e);
-    res.status(500).json({ error: 'Yükləmə xətası' });
-  }
-});
+// ---------- 3. Modal ----------
+function openModal() { document.getElementById('modalOverlay')?.classList.add('open'); }
+function closeModal() {
+  document.getElementById('modalOverlay')?.classList.remove('open');
+  document.getElementById('uploadForm')?.reset();
+}
 
-app.get('/api/books/:id/view', requireAuth, async (req, res) => {
-  try {
-    const book = await db.findBookById(req.params.id);
-    if (!book) return res.status(404).json({ error: 'Kitab tapılmadı' });
-    res.redirect(book.filename);
-  } catch (e) {
-    console.error('VIEW ERROR:', e);
-    res.status(500).json({ error: 'Fayl oxunarkən xəta' });
-  }
-});
+// ---------- 4. Kitab yükləmə (Supabase Client-Side) ----------
+function setupUploadForm() {
+  const form = document.getElementById('uploadForm');
+  if (!form) return;
 
-app.delete('/api/books/:id', requireAuth, async (req, res) => {
-  try {
-    const book = await db.findBookById(req.params.id);
-    if (!book) return res.status(404).json({ error: 'Kitab tapılmadı' });
-    if (book.uploaded_by !== req.session.userId) {
-      return res.status(403).json({ error: 'Yalnız öz kitabınızı silə bilərsiniz' });
+  // Supabase müştərisi (Açarlarını bura yaz)
+  const supabase = supabase.createClient('URL_BURA', 'KEY_BURA');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const pdfInput = document.getElementById('pdfInput');
+    const titleInput = document.getElementById('titleInput');
+    const authorInput = document.getElementById('authorInput');
+    const catInput = document.getElementById('catInput');
+    const uploadBtn = document.getElementById('uploadBtn');
+
+    if (!pdfInput.files[0]) return showToast('Zəhmət olmasa PDF faylı seçin!', 'error');
+
+    uploadBtn.disabled = true;
+    showToast('Yüklənir...', 'success');
+
+    try {
+      const file = pdfInput.files[0];
+      const fileName = Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+
+      // 1. Faylı Supabase-ə göndər
+      const { data, error } = await supabase.storage.from('books').upload(fileName, file);
+      if (error) throw error;
+
+      // 2. URL-i al
+      const publicUrl = supabase.storage.from('books').getPublicUrl(fileName).data.publicUrl;
+
+      // 3. Serverə JSON göndər
+      const res = await fetch('/api/books', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: titleInput.value,
+          author: authorInput.value,
+          category: catInput ? catInput.value : 'Digər',
+          filename: publicUrl,
+          filesize: file.size
+        })
+      });
+
+      if (!res.ok) throw new Error('Serverdə xəta baş verdi');
+      showToast('Kitab yükləndi!');
+      closeModal();
+      fetchBooks();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      uploadBtn.disabled = false;
     }
-
-    const fileName = book.filename.split('/').pop();
-    await supabase.storage.from('books').remove([fileName]);
-    await db.deleteBook(book.id);
-    res.json({ success: true });
-  } catch (e) {
-    console.error('DELETE ERROR:', e);
-    res.status(500).json({ error: 'Silinmə xətası' });
-  }
-});
-
-app.get('/api/stats', async (req, res) => {
-  try {
-    const stats = await db.getStats();
-    res.json(stats);
-  } catch (e) {
-    console.error('STATS ERROR:', e);
-    res.status(500).json({ totalBooks: 0 });
-  }
-});
-
-// ---------- Səhifə Yönləndirmələri ----------
-app.get('/kitabxana', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'library.html'));
-});
-
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/')) return next();
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// ---------- Qlobal xəta idarəedicisi ----------
-// Multer (fayl ölçüsü, naməlum sahə və s.) və digər tutulmamış xətalar
-// bura düşür. Bu olmadan Express default HTML xəta səhifəsi qaytarır,
-// bu da frontend-də JSON.parse-i çökdürür.
-app.use((err, req, res, next) => {
-  console.error('QLOBAL XƏTA:', err);
-  if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: 'Fayl həcmi icazə verilən limitdən böyükdür' });
-  }
-  if (err) {
-    return res.status(400).json({ error: err.message || 'Sorğu emal edilərkən xəta baş verdi' });
-  }
-  next();
-});
-
-// ---------- Server / Vercel export ----------
-// Yalnız lokal işə salınanda port dinlə (məs. `node server.js`).
-// Vercel bu faylı özü import edib serverless funksiya kimi çağırır,
-// ona görə app.listen() Vercel-də ÇAĞIRILMAMALIDIR.
-if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`\n📚 Kitabxana saytı işə düşdü: http://localhost:${PORT}\n`);
   });
 }
 
-module.exports = app;
+// ---------- 5. Kitabı silmək ----------
+async function deleteBook(id) {
+  if (!confirm('Silmək istədiyinizdən əminsiniz?')) return;
+  const res = await fetch(`/api/books/${id}`, { method: 'DELETE', credentials: 'include' });
+  if (res.ok) { showToast('Kitab silindi'); fetchBooks(); }
+}
+
+// ---------- Sürüklə-burax ----------
+function setupDragAndDrop() {
+  const zone = document.getElementById('dropZone');
+  const input = document.getElementById('pdfInput');
+  if (!zone || !input) return;
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.style.borderColor = 'var(--gold)'; });
+  zone.addEventListener('dragleave', () => { zone.style.borderColor = 'var(--line)'; });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    zone.style.borderColor = 'var(--line)';
+    if (e.dataTransfer.files.length) input.files = e.dataTransfer.files;
+  });
+}
